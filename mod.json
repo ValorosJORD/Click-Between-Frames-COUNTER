@@ -7,12 +7,13 @@
 		"ios": "2.2081"
 	},
 	"version": "v1.5.0",
-	"id": "syzzi.click_between_frames",
-	"name": "Click Between Frames",
-	"developer": "syzzi",
-	"description": "Allows inputs to register between frames.",
+	"id": "valoros.cbf-window-finder",
+	"name": "CBF Window Finder",
+	"developer": "Valoros",
+	"description": "Finds input windows with CBF.",
 	"incompatibilities": {
-		"zmx.cbf-lite": ">=1.0.0"
+		"zmx.cbf-lite": ">=1.0.0",
+		"syzzi.click_between_frames": ">=1.0.0"
 	},
 	"tags": [
 		"performance",
@@ -103,6 +104,22 @@
 			"enable-if": "saved:you-must-be-on-linux-to-change-this && wine-workaround",
 			"platforms": ["win"]
 		}
+		"finder-category": { "name": "Window Finder", "type": "title" },
+		"window-finder": {
+			"name": "Run Window Finder",
+			"description": "Run the search when entering a level (normal mode only)",
+			"type": "bool", "default": false
+		},
+		"finder-base": {
+			"name": "Base Script",
+			"description": "Inputs before the tested click, e.g. 120.25+, 132.5-",
+			"type": "string", "default": ""
+		},
+		"finder-lo": { "name": "Range Start (steps)", "type": "float", "default": 0.0 },
+		"finder-hi": { "name": "Range End (steps)", "type": "float", "default": 0.0 },
+		"finder-hold": { "name": "Hold Length (steps)", "type": "float", "default": 12.0 },
+		"finder-target-x": { "name": "Target X", "type": "float", "default": 0.0 },
+		"finder-speed": { "name": "Speed", "type": "float", "default": 1.0 }
 	},
 	"links": {
 		"source": "https://github.com/theyareonit/Click-Between-Frames"
