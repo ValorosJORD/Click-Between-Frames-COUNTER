@@ -3,6 +3,9 @@
 
 #include <limits>
 #include <math.h>
+#include <algorithm>
+#include <sstream>
+#include <string>
 
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -30,6 +33,7 @@ std::deque<struct Step> stepQueue;
 
 bool softToggle;
 bool enableRightClick;
+bool clickOnSteps = false; // moved up here so WindowFinder can see it
 
 PlayerButtonCommand nextInput = EMPTY_INPUT;
 
@@ -42,6 +46,61 @@ bool linuxNative = false;
 
 std::array<std::unordered_set<size_t>, 6> inputBinds;
 std::unordered_set<uint16_t> heldInputs;
+
+// ===== Window finder =====
+struct ScriptedInput {
+	double t;                              // time in steps since level reset (step index + fraction)
+	bool push;
+	PlayerButton button = PlayerButton::Jump;
+	bool p2 = false;
+};
+
+bool g_scripted = false;                   // true while the finder is running
+long long g_stepCounter = 0;               // physics steps executed since resetLevel
+std::vector<ScriptedInput> g_script;       // must be sorted by t
+size_t g_scriptIdx = 0;
+
+void buildScriptedStepQueue(int stepCount) {
+	for (int i = 0; i < stepCount; i++) {
+		long long step = g_stepCounter + i;
+		double elapsed = 0.0;
+		while (g_scriptIdx < g_script.size()) {
+			const ScriptedInput& in = g_script[g_scriptIdx];
+			if (in.t >= (double)(step + 1)) break;
+			double frac = std::max(0.0, in.t - (double)step);
+			PlayerButtonCommand cmd {
+				.m_button = in.button,
+				.m_isPush = in.push,
+				.m_isPlayer2 = in.p2,
+				.m_timestamp = 1.0 // MUST be nonzero: popStepQueue treats timestamp 0 as "no input"
+			};
+			stepQueue.emplace_back(Step{ cmd, std::clamp(frac - elapsed, SMALLEST_FLOAT, 1.0), false });
+			elapsed = frac;
+			g_scriptIdx++;
+		}
+		stepQueue.emplace_back(Step{ EMPTY_INPUT, std::max(SMALLEST_FLOAT, 1.0 - elapsed), true });
+	}
+}
+
+/*
+parse a script like "52.312+, 60.1-" (+ = press, - = release), the same format the REC log prints
+*/
+std::vector<ScriptedInput> parseScript(std::string const& s) {
+	std::vector<ScriptedInput> out;
+	std::stringstream ss(s);
+	std::string tok;
+	while (std::getline(ss, tok, ',')) {
+		tok.erase(0, tok.find_first_not_of(" \t"));
+		tok.erase(tok.find_last_not_of(" \t") + 1);
+		if (tok.empty()) continue;
+		char c = tok.back();
+		if (c != '+' && c != '-') { log::warn("Bad script token '{}'", tok); continue; }
+		tok.pop_back();
+		try { out.push_back({ std::stod(tok), c == '+' }); }
+		catch (...) { log::warn("Bad script token '{}'", tok); }
+	}
+	return out;
+}
 
 /*
 this function copies over the input data and uses it to build a queue of physics steps
@@ -67,6 +126,16 @@ void buildStepQueue(int stepCount) {
 	#endif
 
 	skipUpdate = false;
+
+	if (g_scripted) {
+		playLayer->m_queuedButtons.clear(); // ignore real clicks during trials
+		inputVector.clear();
+		firstFrame = false;                 // don't drop the first frame after a reset
+		lastFrameTime = currentFrameTime;
+		buildScriptedStepQueue(stepCount);
+		return;
+	}
+	
 	if (firstFrame) {
 		skipUpdate = true;
 		firstFrame = false;
@@ -90,6 +159,11 @@ void buildStepQueue(int stepCount) {
 
 			if (input.m_timestamp - lastFrameTime < stepDelta * (i + 1)) { // if the next input in the vector happened on the current step, or if its the last step
 				double inputTime = fmod((input.m_timestamp - lastFrameTime), stepDelta) / stepDelta; // proportion of step elapsed at the time the input was made
+				// record mode: prints in the same format finder-base accepts, plus P1 x for picking a target
+				log::info("REC {:.9f}{}  (x={:.2f})",
+					(double)(g_stepCounter + i) + inputTime,
+					input.m_isPush ? "+" : "-",
+					playLayer->m_player1->getPositionX());
 				stepQueue.emplace_back(Step{ input, std::clamp(inputTime - elapsedTime, SMALLEST_FLOAT, 1.0), false });
 				elapsedTime = inputTime;
 				inputIdx++;
@@ -225,6 +299,123 @@ int calculateStepCount(double delta, float timewarp, bool forceVanilla) {
 
 bool safeMode;
 
+class WindowFinder {
+public:
+	// config, loaded from mod settings in start()
+	std::vector<ScriptedInput> base;   // inputs needed to reach the section (from REC logs)
+	double lo = 0.0, hi = 0.0;         // search range for the press, in steps
+	double hold = 12.0;                // release this many steps after the press
+	float targetX = 0.f;               // pass = P1 reaches this x alive
+	double scanStep = 1.0 / 32.0;
+	double eps = 1e-7;                 // below this, float substep math can't tell values apart
+	float speed = 1.f;                 // scheduler timescale; verify results match 1x
+
+	void start(PlayLayer* pl) {
+		if (softToggle || clickOnSteps || physicsBypass) {
+			log::error("Finder needs CBF on, Click on Steps off, Physics Bypass off");
+			return;
+		}
+		if (pl->m_isPracticeMode) {
+			log::error("Finder must run in normal mode (step counter resets to 0 on every reset)");
+			return;
+		}
+
+		Mod* mod = Mod::get();
+		base     = parseScript(mod->getSettingValue<std::string>("finder-base"));
+		lo       = mod->getSettingValue<double>("finder-lo");
+		hi       = mod->getSettingValue<double>("finder-hi");
+		hold     = mod->getSettingValue<double>("finder-hold");
+		targetX  = (float)mod->getSettingValue<double>("finder-target-x");
+		speed    = (float)mod->getSettingValue<double>("finder-speed");
+
+		if (hi <= lo || targetX <= 0.f) {
+			log::error("Set finder-lo < finder-hi and finder-target-x > 0");
+			return;
+		}
+
+		g_scripted = true;
+		phase = Scan; cur = lo; scanT.clear(); scanR.clear(); edges.clear(); bounds.clear(); ei = 0;
+		CCDirector::sharedDirector()->getScheduler()->setTimeScale(speed);
+		log::info("Finder started: range [{}, {}], hold {}, targetX {}, {} base inputs", lo, hi, hold, targetX, base.size());
+		onReset();
+	}
+
+	void onReset() {
+		if (phase == Done) return;
+		g_script = base;
+		g_script.push_back({ cur, true });
+		g_script.push_back({ cur + hold, false });
+		std::sort(g_script.begin(), g_script.end(),
+			[](auto& a, auto& b) { return a.t < b.t; });
+		running = true;
+	}
+
+	void poll() {
+		PlayLayer* pl = PlayLayer::get();
+		if (!pl || !running) return;
+		if (pl->m_playerDied) { running = false; report(false); }         // game auto-resets
+		else if (pl->m_player1->getPositionX() >= targetX) {
+			running = false; report(true); pl->resetLevel();
+		}
+	}
+
+	void abort() {
+		if (!g_scripted) return;
+		log::warn("Finder aborted (left level)");
+		phase = Done; running = false; g_scripted = false;
+		CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.f);
+	}
+
+private:
+	enum Phase { Scan, Bisect, Done } phase = Done;
+	struct Edge { double a, b; bool ra; };
+	double cur = 0.0;
+	bool running = false;
+	std::vector<double> scanT; std::vector<bool> scanR;
+	std::vector<Edge> edges; size_t ei = 0;
+	std::vector<std::pair<double, bool>> bounds; // (time, becomesPass)
+
+	void report(bool pass) {
+		log::debug("trial t={:.9f} {}", cur, pass ? "PASS" : "fail");
+
+		if (phase == Scan) {
+			scanT.push_back(cur); scanR.push_back(pass);
+			cur += scanStep;
+			if (cur <= hi) return;
+			if (scanR.front() || scanR.back()) log::warn("Pass at range edge: widen lo/hi");
+			for (size_t i = 1; i < scanR.size(); i++)
+				if (scanR[i] != scanR[i - 1]) edges.push_back({ scanT[i - 1], scanT[i], scanR[i - 1] });
+			if (edges.empty()) { log::warn("No transitions found"); finish(); return; }
+			phase = Bisect; ei = 0; cur = mid();
+		}
+		else if (phase == Bisect) {
+			Edge& e = edges[ei];
+			(pass == e.ra ? e.a : e.b) = cur;
+			if (e.b - e.a > eps) { cur = mid(); return; }
+			bounds.push_back({ 0.5 * (e.a + e.b), !e.ra });
+			if (++ei < edges.size()) { cur = mid(); return; }
+			finish();
+		}
+	}
+
+	double mid() { return 0.5 * (edges[ei].a + edges[ei].b); }
+
+	void finish() {
+		double total = 0.0, start = 0.0;
+		for (auto& [t, toPass] : bounds) {
+			if (toPass) start = t;
+			else {
+				log::info("Window [{:.9f}, {:.9f}] = {:.6f} frames", start, t, t - start);
+				total += t - start;
+			}
+		}
+		log::info("Total window: {:.6f} frames ({:.6f} ms)", total, total / 240.0 * 1000.0);
+		phase = Done; running = false; g_scripted = false;
+		CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.f);
+	}
+};
+WindowFinder finder;
+
 class $modify(PlayLayer) {
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
 		#ifdef GEODE_IS_WINDOWS
@@ -235,7 +426,22 @@ class $modify(PlayLayer) {
 			this->m_clickBetweenSteps = false;
 			this->m_clickOnSteps = false;
 		}
+		if (result && Mod::get()->getSettingValue<bool>("window-finder")) finder.start(this);
 		return result;
+	}
+
+	void resetLevel() {
+		PlayLayer::resetLevel();
+		g_stepCounter = 0;
+		g_scriptIdx = 0;
+		stepQueue.clear();
+		nextInput = EMPTY_INPUT;
+		if (g_scripted) finder.onReset();
+	}
+
+	void onQuit() {
+		finder.abort();
+		PlayLayer::onQuit();
 	}
 
 	// disable progress in safe mode
@@ -315,11 +521,12 @@ class $modify(CCScheduler) {
 		#endif
 		
 		CCScheduler::update(dt);
+
+		if (g_scripted) finder.poll();
 	}
 };
 
 int stepCount;
-bool clickOnSteps = false;
 
 class $modify(GJBaseGameLayer) {
 	static void onModify(auto& self) {
@@ -390,6 +597,9 @@ class $modify(PlayerObject) {
 	// split a single step based on the entries in stepQueue
 	void update(float stepDelta) {
 		PlayLayer* pl = PlayLayer::get();
+
+		// window finder: one P1 hook call per physics step (substeps call the base update directly)
+		if (pl && this == pl->m_player1 && !midStep) g_stepCounter++;
 		
 		if (pl && this != pl->m_player1 || midStep) { // do all of the logic during the P1 update for simplicity
 			if (midStep || !inputThisStep || this != pl->m_player2) PlayerObject::update(stepDelta);
